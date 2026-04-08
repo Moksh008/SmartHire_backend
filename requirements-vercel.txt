@@ -1,0 +1,10 @@
+fastapi>=0.95.0
+uvicorn>=0.21.0
+python-multipart>=0.0.6
+PyPDF2>=3.0.0
+rapidfuzz>=2.13.7
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Note: heavy ML packages like sentence-transformers and torch are intentionally omitted.
+# For semantic embeddings, call an external API (OpenAI/HuggingFace) or host a separate model server.
