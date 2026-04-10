@@ -1,502 +1,868 @@
 import io
+import re
 import streamlit as st
 from PyPDF2 import PdfReader
-import re
 import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 from rapidfuzz import fuzz
 import matplotlib.pyplot as plt
+import numpy as np
 
-# Caching helpers: cache the transformer model and embedding computations
+# ─────────────────────────────────────────────
+# PAGE CONFIG
+# ─────────────────────────────────────────────
+st.set_page_config(
+    page_title="AI Resume Screener",
+    page_icon="🧠",
+    layout="wide"
+)
+
+# ─────────────────────────────────────────────
+# LOAD BERT MODEL (cached so it loads once)
+# ─────────────────────────────────────────────
 @st.cache_resource
-def load_embedding_model():
-    try:
-        from sentence_transformers import SentenceTransformer
-        return SentenceTransformer("all-MiniLM-L6-v2")
-    except ModuleNotFoundError as e:
-        return None
+def load_model():
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer('all-MiniLM-L6-v2')
 
-@st.cache_data
-def encode_texts(texts_tuple):
-    """Encode a tuple of texts using the cached model. Returns numpy array or None."""
-    model = load_embedding_model()
-    if model is None:
-        return None
-    return model.encode(list(texts_tuple), convert_to_numpy=True)
+model = load_model()
 
-# ------------------ PAGE CONFIG ------------------
-st.set_page_config(page_title="Smart Hiring Assistant", layout="wide")
-
-# ------------------ TITLE ------------------
-st.title("💼 Smart Hiring Assistant")
-
-# ------------------ SESSION STATE FOR ROLE ------------------
-if "role" not in st.session_state:
-    st.session_state.role = None
-
-# ------------------ ROLE SELECTION UI ------------------
-st.markdown("## What do you want to do?")
-
-col1, col2 = st.columns(2)
-
-with col1:
-    if st.button("👤 I am a Candidate"):
-        st.session_state.role = "Candidate"
-
-with col2:
-    if st.button("🧑‍💼 I am a Recruiter"):
-        st.session_state.role = "Recruiter"
-
-# Reset button
-if st.session_state.role:
-    if st.button("🔄 Reset"):
-        st.session_state.role = None
-
-role = st.session_state.role
-
-# ------------------ SKILLS LIST ------------------
-skills_list = [
-    "python", "java", "c++", "sql", "html", "css", "javascript",
-    "machine learning", "deep learning", "data analysis",
-    "pandas", "numpy", "tensorflow", "flask", "react",
-    "mongodb", "excel", "power bi"
-]
-
-# Skill aliases to improve matching (alias -> canonical skill)
-skill_aliases = {
-    "ml": "machine learning",
-    "machine-learning": "machine learning",
-    "deep-learning": "deep learning",
-    "js": "javascript",
-    "py": "python",
-    "c": "c++",
-    "powerbi": "power bi",
-    "nlp": "natural language processing",
-}
-
-# Skill ontology: parent -> related terms
-skill_ontology = {
-    "machine learning": ["ml", "supervised learning", "unsupervised learning", "deep learning"],
-    "data analysis": ["pandas", "numpy", "data visualization", "excel"],
-    "web development": ["html", "css", "javascript", "react", "flask"],
-    "databases": ["sql", "mongodb"],
-    "devops": ["docker", "kubernetes"],
-    "nlp": ["nlp", "natural language processing"],
-}
-
-
-
-# ------------------ FUNCTIONS ------------------
-
-def extract_text_from_pdf(file):
-    reader = PdfReader(file)
+# ─────────────────────────────────────────────
+# UTILITIES
+# ─────────────────────────────────────────────
+def extract_text_from_pdf(uploaded_file):
+    reader = PdfReader(io.BytesIO(uploaded_file.read()))
     text = ""
-    try:
-        for page in reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-    except Exception:
-        # fall back to best-effort empty string
-        text = ""
-
-    # If simple extraction returned very little, try OCR fallback if available
-    if len(text.strip()) < 20:
-        try:
-            from pdf2image import convert_from_bytes
-            import pytesseract
-            images = convert_from_bytes(file.read())
-            ocr_text = ""
-            for img in images:
-                ocr_text += pytesseract.image_to_string(img) + "\n"
-            if ocr_text.strip():
-                return ocr_text
-        except Exception:
-            # OCR dependencies missing or failed — return whatever we have
-            pass
-
+    for page in reader.pages:
+        extracted = page.extract_text()
+        if extracted:
+            text += extracted + "\n"
     return text
 
-def is_resume(text):
-    keywords = ["education", "experience", "skills", "projects", "internship", "work"]
-    text = text.lower()
-    return sum(1 for word in keywords if word in text) >= 2
-
-
-def split_sections(text):
-    """Split resume text into sections (skills, experience, projects, education, other)."""
-    sections = {"skills": "", "experience": "", "projects": "", "education": "", "other": ""}
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    current = "other"
-    for line in lines:
-        low = line.lower()
-        if re.search(r"^skills?:?$", low) or "skills" in low and len(line.split()) <= 4:
-            current = "skills"
-            continue
-        if re.search(r"^experience:?$", low) or "experience" in low:
-            current = "experience"
-            continue
-        if re.search(r"^projects?:?$", low) or "project" in low:
-            current = "projects"
-            continue
-        if re.search(r"^education:?$", low) or "education" in low:
-            current = "education"
-            continue
-        sections[current] += line + "\n"
-    return sections
 
 def clean_text(text):
     text = text.lower()
-    text = re.sub(r'[^a-zA-Z\s]', ' ', text)
+    text = re.sub(r'\n+', ' ', text)
     text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'[^a-zA-Z0-9 .,]', '', text)
     return text.strip()
 
 
-def parse_job_description(jd_text):
-    """Extract required and optional skills from the job description using simple heuristics."""
-    jd = jd_text or ""
-    lines = [l.strip() for l in jd.splitlines() if l.strip()]
-    required = set()
-    optional = set()
+def chunk_text(text, chunk_size=80):
+    words = text.split()
+    chunks = []
+    step = chunk_size // 2
+    for i in range(0, len(words), step):
+        chunk = " ".join(words[i:i + chunk_size])
+        if chunk:
+            chunks.append(chunk)
+    return chunks
 
-    # Look for explicit sections
-    current = None
-    for line in lines:
-        low = line.lower()
-        if low.startswith("required") or "must have" in low:
-            current = "required"
-            continue
-        if low.startswith("optional") or "nice to have" in low:
-            current = "optional"
-            continue
-        # if line contains skill terms, extract
-        found = extract_skills(line)
-        if current == "required":
-            required.update(found)
-        elif current == "optional":
-            optional.update(found)
-        else:
-            # distribute into required if words like 'required' in the line
-            if "required" in low or "must" in low:
-                required.update(found)
-            else:
-                # default to required
-                required.update(found)
 
-    return {"required": sorted(required), "optional": sorted(optional)}
+def get_embeddings(chunks):
+    return model.encode(chunks, batch_size=32, show_progress_bar=False)
 
-def extract_skills(text):
-    """Extract skills from text using exact, alias, and fuzzy matching."""
-    found = set()
-    # normalize text for matching
-    text = text.lower()
-    # sentences for localized fuzzy matching
-    sentences = [s.strip() for s in re.split(r'[\n\r\.]+', text) if s.strip()]
 
-    for skill in skills_list:
-        canonical = skill.lower()
-
-        # 1) exact match
-        if re.search(r'\b' + re.escape(canonical) + r'\b', text):
-            found.add(skill)
-            continue
-
-        # 2) alias match
-        for alias, target in skill_aliases.items():
-            if target == canonical:
-                if re.search(r'\b' + re.escape(alias) + r'\b', text):
-                    found.add(skill)
-                    break
-        if skill in found:
-            continue
-
-        # 3) fuzzy match against sentences (handles minor typos/plurals)
-        for s in sentences:
-            score = fuzz.partial_ratio(canonical, s)
-            if score >= 80:
-                found.add(skill)
-                break
-
-    # Map found related terms to ontology parents too
-    parents_found = set()
-    for parent, terms in skill_ontology.items():
-        parent_lower = parent.lower()
-        # if parent already matched directly
-        if any(parent_lower == f.lower() for f in found):
-            parents_found.add(parent)
-            continue
-        # check related terms
-        for t in terms:
-            t_lower = t.lower()
-            if re.search(r'\b' + re.escape(t_lower) + r'\b', text):
-                parents_found.add(parent)
-                break
-            # fuzzy on related terms
-            for s in sentences:
-                if fuzz.partial_ratio(t_lower, s) >= 85:
-                    parents_found.add(parent)
-                    break
-    # Combine canonical found skills (avoid duplicates)
-    final_skills = set(found)
-    # replace related term matches by parent when parent not already in final_skills
-    for p in parents_found:
-        # keep parent as canonical
-        final_skills.add(p)
-
-    return sorted(final_skills)
-
-def calculate_match_score(resume, jd):
-    # overall semantic similarity between resume and job description
-    model = load_embedding_model()
-    if model is None:
+def bert_similarity_score(resume_text, jd_text):
+    if not resume_text.strip() or not jd_text.strip():
         return 0.0
-    try:
-        vecs = encode_texts((resume, jd))
-        if vecs is None:
-            return 0.0
-        similarity = cosine_similarity([vecs[0]], [vecs[1]])
-        return float(similarity[0][0])
-    except Exception:
+    resume_chunks = chunk_text(resume_text)
+    jd_chunks = chunk_text(jd_text)
+    if not resume_chunks or not jd_chunks:
         return 0.0
+    resume_emb = get_embeddings(resume_chunks)
+    jd_emb = get_embeddings(jd_chunks)
+    sim_matrix = cosine_similarity(resume_emb, jd_emb)
+    best_per_jd = sim_matrix.max(axis=0)
+    return float(best_per_jd.mean())
 
 
-def section_embeddings(section_texts):
-    """Encode a dict of section_name->text and return name->embedding dict."""
-    names = []
-    texts = []
-    for name, t in section_texts.items():
-        names.append(name)
-        texts.append(t if t else "")
-    res = encode_texts(tuple(texts))
-    if res is None:
-        return {n: None for n in names}
-    return {n: res[i] for i, n in enumerate(names)}
+def calculate_fuzzy_score(resume_text, jd_text):
+    return fuzz.partial_ratio(resume_text[:5000], jd_text[:5000])
 
-# ------------------ CANDIDATE FLOW ------------------
 
-if role == "Candidate":
+# ─────────────────────────────────────────────
+# SKILL EXTRACTION
+# ─────────────────────────────────────────────
 
-    st.subheader("📄 Upload Your Resume")
-    uploaded_file = st.file_uploader("Upload your resume (PDF)", type=["pdf"])
+# Required skills signals in JD text
+REQUIRED_SIGNALS = [
+    "required", "must have", "must-have", "essential", "mandatory",
+    "you must", "we require", "minimum requirement", "necessary"
+]
+OPTIONAL_SIGNALS = [
+    "preferred", "nice to have", "nice-to-have", "bonus", "plus",
+    "advantage", "desirable", "good to have", "optional", "beneficial"
+]
 
-    st.subheader("📝 Enter Job Description")
-    job_description = st.text_area("Paste job description here")
+SKILL_KEYWORDS = [
+    "python", "java", "javascript", "typescript", "c++", "c#", "sql", "r", "go", "rust", "scala",
+    "machine learning", "deep learning", "nlp", "bert", "gpt", "llm", "ai", "artificial intelligence",
+    "computer vision", "reinforcement learning", "neural network", "transformer",
+    "tensorflow", "pytorch", "keras", "scikit-learn", "xgboost", "lightgbm", "catboost",
+    "pandas", "numpy", "matplotlib", "seaborn", "plotly", "scipy", "statsmodels",
+    "data engineering", "etl", "data pipelines", "airflow", "apache spark", "spark", "kafka",
+    "aws", "gcp", "azure", "cloud", "docker", "kubernetes", "ci/cd", "devops", "terraform",
+    "react", "node.js", "fastapi", "flask", "django", "spring boot", "express",
+    "postgresql", "mysql", "mongodb", "redis", "elasticsearch", "cassandra", "snowflake",
+    "git", "linux", "rest api", "graphql", "microservices", "grpc",
+    "streamlit", "tableau", "power bi", "looker", "qlik",
+    "data analysis", "data science", "data visualization", "business intelligence",
+    "communication", "leadership", "teamwork", "problem solving", "agile", "scrum",
+    "project management", "product management", "stakeholder management",
+    "excel", "vba", "sas", "matlab", "hadoop", "hive", "pig",
+    "penetration testing", "cybersecurity", "network security", "ethical hacking",
+    "nlp", "text mining", "feature engineering", "a/b testing", "experimentation",
+    "html", "css", "sass", "webpack", "git", "bash", "shell", "powershell"
+]
 
-    if uploaded_file and job_description:
+DEGREE_KEYWORDS = {
+    "phd": 5, "doctorate": 5, "ph.d": 5,
+    "master": 4, "m.s.": 4, "msc": 4, "m.tech": 4, "mba": 4, "m.e.": 4,
+    "bachelor": 3, "b.s.": 3, "bsc": 3, "b.tech": 3, "b.e.": 3, "undergraduate": 3,
+    "associate": 2, "diploma": 2,
+    "high school": 1, "secondary": 1
+}
 
-        st.success(f"Uploaded: {uploaded_file.name}")
+CERT_KEYWORDS = [
+    "aws certified", "google cloud", "azure certified", "cka", "ckad",
+    "pmp", "scrum master", "csm", "cissp", "ceh", "comptia",
+    "tensorflow certificate", "databricks", "snowflake", "tableau certified",
+    "coursera", "udacity", "edx", "certification", "certified"
+]
 
-        resume_text = extract_text_from_pdf(uploaded_file)
+JOB_TITLE_KEYWORDS = [
+    "software engineer", "data scientist", "data engineer", "ml engineer", "machine learning engineer",
+    "backend developer", "frontend developer", "full stack", "devops engineer", "cloud engineer",
+    "product manager", "project manager", "business analyst", "data analyst",
+    "security engineer", "cybersecurity", "ai engineer", "nlp engineer",
+    "research scientist", "research engineer", "applied scientist",
+    "architect", "tech lead", "senior engineer", "junior engineer",
+    "intern", "associate", "lead", "principal", "staff engineer", "manager"
+]
 
-        if is_resume(resume_text):
 
-            cleaned_resume = resume_text  # keep original for sections
-            cleaned_jd = job_description
+def extract_skills_from_text(text):
+    text_lower = text.lower()
+    found = [skill for skill in SKILL_KEYWORDS if skill in text_lower]
+    return list(set(found))
 
-            # parse sections
-            resume_sections = split_sections(cleaned_resume)
-            jd_parsed = parse_job_description(cleaned_jd)
 
-            # skills
-            resume_skills = extract_skills(resume_sections.get("skills", "") + "\n" + cleaned_resume)
-            jd_required = jd_parsed.get("required", [])
-            jd_optional = jd_parsed.get("optional", [])
+def classify_jd_skills(jd_text):
+    """
+    Split JD skills into required vs optional by parsing context sentences.
+    Returns: (required_skills, optional_skills)
+    """
+    required_skills = []
+    optional_skills = []
+    all_jd_skills = extract_skills_from_text(jd_text)
 
-            # semantic similarities: overall and per-section
-            overall_sim = calculate_match_score(cleaned_resume, cleaned_jd)
+    jd_lower = jd_text.lower()
+    sentences = re.split(r'[.\n;]', jd_lower)
 
-            # embed sections for fine-grained similarity
-            resume_embeds = section_embeddings(resume_sections)
-            jd_sections = {"skills": ' '.join(jd_required), "experience": cleaned_jd, "projects": cleaned_jd}
-            jd_embeds = section_embeddings(jd_sections)
+    skill_classification = {}
+    for skill in all_jd_skills:
+        skill_classification[skill] = "required"  # default
 
-            # compute section similarities (experience/projects use jd as proxy)
-            experience_sim = 0.0
-            projects_sim = 0.0
-            skills_sim = 0.0
-            try:
-                if resume_embeds.get("experience") is not None and jd_embeds.get("experience") is not None:
-                    experience_sim = float(cosine_similarity([resume_embeds["experience"]], [jd_embeds["experience"]])[0][0])
-                if resume_embeds.get("projects") is not None and jd_embeds.get("projects") is not None:
-                    projects_sim = float(cosine_similarity([resume_embeds["projects"]], [jd_embeds["projects"]])[0][0])
-                if resume_embeds.get("skills") is not None and jd_embeds.get("skills") is not None:
-                    skills_sim = float(cosine_similarity([resume_embeds["skills"]], [jd_embeds["skills"]])[0][0])
-            except Exception:
-                experience_sim = projects_sim = skills_sim = 0.0
+    for sentence in sentences:
+        is_required = any(sig in sentence for sig in REQUIRED_SIGNALS)
+        is_optional = any(sig in sentence for sig in OPTIONAL_SIGNALS)
+        for skill in all_jd_skills:
+            if skill in sentence:
+                if is_optional:
+                    skill_classification[skill] = "optional"
+                elif is_required:
+                    skill_classification[skill] = "required"
 
-            match_score = overall_sim
-
-            common_skills = set(resume_skills) & set(jd_required + jd_optional)
-            missing_required = set(jd_required) - set(resume_skills)
-            missing_optional = set(jd_optional) - set(resume_skills)
-
-            # skill_score: required and optional weighted (required more important)
-            req_score = (len(set(resume_skills) & set(jd_required)) / len(jd_required) * 100) if jd_required else 0
-            opt_score = (len(set(resume_skills) & set(jd_optional)) / len(jd_optional) * 100) if jd_optional else 0
-            skill_score = (0.75 * req_score) + (0.25 * opt_score)
-
-            # experience relevance: use experience_sim normalized
-            experience_score = experience_sim * 100
-
-            # final score: 0.5 semantic + 0.3 skill + 0.2 experience
-            final_score = (0.5 * match_score * 100) + (0.3 * skill_score) + (0.2 * experience_score)
-
-            st.subheader("📊 Your Result")
-            st.success(f"🎯 Final ATS Score: {final_score:.2f}%")
-
-            st.write(f"🔹 Overall Match: {match_score*100:.2f}%")
-            st.write(f"🔹 Skill Match: {skill_score:.2f}%")
-            st.write(f"🔹 Experience Relevance: {experience_score:.2f}%")
-
-            st.subheader("✅ Matching Skills")
-            st.write(sorted(list(common_skills)))
-
-            st.subheader("❌ Missing Required Skills")
-            st.write(sorted(list(missing_required)))
-
-            st.subheader("ℹ️ Suggestions")
-            suggestions = []
-            if experience_score < 40:
-                suggestions.append("Consider adding more detailed experience descriptions relevant to the job.")
-            if len(missing_required) > 0:
-                for m in missing_required:
-                    suggestions.append(f"Consider adding or highlighting your experience with: {m}")
-            if match_score * 100 < 40:
-                suggestions.append("Include more relevant projects and keywords from the job description.")
-
-            if suggestions:
-                for s in suggestions:
-                    st.write("- ", s)
-            else:
-                st.write("Your resume looks well-aligned with the job description.")
-
-            # Highlight matched skills in resume text
-            highlighted = cleaned_resume
-            for sk in sorted(list(common_skills)):
-                highlighted = re.sub(r'(?i)(' + re.escape(sk) + r')', r"**\1**", highlighted)
-            st.subheader("📄 Resume Preview (matched skills highlighted)")
-            st.markdown(highlighted)
-
-            # Export results
-            result_row = {
-                "Resume": uploaded_file.name,
-                "Final Score (%)": round(final_score, 2),
-                "Overall (%)": round(match_score * 100, 2),
-                "Skill Match (%)": round(skill_score, 2),
-                "Experience (%)": round(experience_score, 2),
-                "Matched Skills": ", ".join(sorted(list(common_skills)))
-            }
-            csv_buf = io.StringIO()
-            pd.DataFrame([result_row]).to_csv(csv_buf, index=False)
-            st.download_button("Download result as CSV", data=csv_buf.getvalue(), file_name=f"{uploaded_file.name}_result.csv")
-
+    for skill, label in skill_classification.items():
+        if label == "required":
+            required_skills.append(skill)
         else:
-            st.error("❌ This does not look like a valid resume")
+            optional_skills.append(skill)
 
-# ------------------ RECRUITER FLOW ------------------
+    return required_skills, optional_skills
 
-elif role == "Recruiter":
 
-    st.subheader("📂 Upload Candidate Resumes")
-    uploaded_files = st.file_uploader(
-        "Upload multiple resumes (PDF)",
-        type=["pdf"],
-        accept_multiple_files=True
+def match_skills_bert(resume_skills, jd_skills, threshold=0.65):
+    if not resume_skills or not jd_skills:
+        return [], jd_skills
+    jd_emb = get_embeddings(jd_skills)
+    res_emb = get_embeddings(resume_skills)
+    sim_matrix = cosine_similarity(res_emb, jd_emb)
+    matched = []
+    missing = []
+    for j, jd_skill in enumerate(jd_skills):
+        best_score = sim_matrix[:, j].max()
+        if best_score >= threshold:
+            matched.append((jd_skill, float(best_score)))
+        else:
+            missing.append(jd_skill)
+    return matched, missing
+
+
+# ─────────────────────────────────────────────
+# EXPERIENCE PARSER
+# ─────────────────────────────────────────────
+
+def extract_years_of_experience(text):
+    """
+    Extract total years of experience from resume text.
+    Looks for patterns like '5 years', '3+ years', date ranges, etc.
+    """
+    text_lower = text.lower()
+    years = []
+
+    # Pattern: "X years of experience" or "X+ years"
+    pattern1 = re.findall(r'(\d+)\+?\s*(?:years?|yrs?)(?:\s+of)?\s+(?:experience|exp)', text_lower)
+    years.extend([int(y) for y in pattern1])
+
+    # Pattern: date ranges like "2019 - 2023" or "Jan 2018 – Dec 2022"
+    pattern2 = re.findall(r'(20\d{2}|19\d{2})\s*[-–—to]+\s*(20\d{2}|19\d{2}|present|current)', text_lower)
+    current_year = 2024
+    for start, end in pattern2:
+        try:
+            s = int(start)
+            e = current_year if end in ('present', 'current') else int(end)
+            diff = e - s
+            if 0 < diff <= 50:
+                years.append(diff)
+        except:
+            pass
+
+    if not years:
+        return 0
+
+    # Avoid double-counting overlapping ranges
+    return min(sum(years), 40)  # cap at 40 to avoid overflow
+
+
+def extract_required_experience(jd_text):
+    """Extract required years from JD."""
+    patterns = re.findall(r'(\d+)\+?\s*(?:years?|yrs?)(?:\s+of)?\s+(?:experience|exp)', jd_text.lower())
+    if patterns:
+        return max([int(p) for p in patterns])
+    return 0
+
+
+def extract_job_titles(text):
+    text_lower = text.lower()
+    found = [title for title in JOB_TITLE_KEYWORDS if title in text_lower]
+    return found
+
+
+def score_experience(resume_text, jd_text):
+    """
+    Score experience out of 100:
+    - Years match: 50 pts
+    - Role title relevance: 30 pts (BERT)
+    - Seniority alignment: 20 pts
+    """
+    resume_years = extract_years_of_experience(resume_text)
+    required_years = extract_required_experience(jd_text)
+
+    # Years score (50 pts)
+    if required_years == 0:
+        years_score = 50  # no requirement stated, give full
+    elif resume_years >= required_years:
+        years_score = 50
+    else:
+        years_score = round((resume_years / required_years) * 50)
+
+    # Role relevance via BERT (30 pts)
+    resume_exp_section = extract_section(resume_text.lower(), SECTION_HEADERS["experience"])
+    role_score_raw = bert_similarity_score(resume_exp_section or resume_text, jd_text) if resume_exp_section else 0
+    role_score = round(role_score_raw * 30)
+
+    # Seniority alignment (20 pts)
+    jd_titles = extract_job_titles(jd_text)
+    resume_titles = extract_job_titles(resume_text)
+    seniority_keywords = {
+        "senior": 3, "lead": 3, "principal": 4, "staff": 4, "architect": 4,
+        "junior": 1, "intern": 0, "associate": 2, "manager": 3, "director": 4
+    }
+    jd_level = 2  # default mid-level
+    resume_level = 2
+
+    for kw, level in seniority_keywords.items():
+        if kw in jd_text.lower():
+            jd_level = level
+        if kw in resume_text.lower():
+            resume_level = level
+
+    if resume_level >= jd_level:
+        seniority_score = 20
+    else:
+        gap = jd_level - resume_level
+        seniority_score = max(0, 20 - gap * 5)
+
+    total = min(years_score + role_score + seniority_score, 100)
+    return total, resume_years, required_years, resume_level, jd_level
+
+
+# ─────────────────────────────────────────────
+# EDUCATION PARSER
+# ─────────────────────────────────────────────
+
+def score_education(resume_text, jd_text):
+    """
+    Score education out of 100:
+    - Degree level match: 60 pts
+    - Field relevance (BERT): 40 pts
+    """
+    resume_lower = resume_text.lower()
+    jd_lower = jd_text.lower()
+
+    resume_degree_level = 0
+    resume_degree_name = "Not detected"
+    for degree, level in sorted(DEGREE_KEYWORDS.items(), key=lambda x: -x[1]):
+        if degree in resume_lower:
+            resume_degree_level = level
+            resume_degree_name = degree.title()
+            break
+
+    jd_degree_level = 0
+    for degree, level in sorted(DEGREE_KEYWORDS.items(), key=lambda x: -x[1]):
+        if degree in jd_lower:
+            jd_degree_level = level
+            break
+
+    if jd_degree_level == 0:
+        jd_degree_level = 3  # default: assume bachelor's required
+
+    if resume_degree_level >= jd_degree_level:
+        degree_score = 60
+    else:
+        gap = jd_degree_level - resume_degree_level
+        degree_score = max(0, 60 - gap * 15)
+
+    # Field relevance via BERT
+    edu_section = extract_section(resume_text.lower(), SECTION_HEADERS["education"])
+    if edu_section:
+        field_score_raw = bert_similarity_score(edu_section, jd_text)
+        field_score = round(field_score_raw * 40)
+    else:
+        field_score = 20  # partial credit if section not found
+
+    total = min(degree_score + field_score, 100)
+    return total, resume_degree_name, resume_degree_level, jd_degree_level
+
+
+# ─────────────────────────────────────────────
+# CERTIFICATION SCORER
+# ─────────────────────────────────────────────
+
+def score_certifications(resume_text, jd_text):
+    """Score certifications: presence in resume vs. JD mentions (0-100)."""
+    resume_lower = resume_text.lower()
+    jd_lower = jd_text.lower()
+
+    jd_certs = [c for c in CERT_KEYWORDS if c in jd_lower]
+    resume_certs = [c for c in CERT_KEYWORDS if c in resume_lower]
+
+    if not jd_certs:
+        # No certs required; bonus for having any
+        if resume_certs:
+            return 80, resume_certs, []
+        return 70, [], []
+
+    matched = [c for c in jd_certs if c in resume_lower]
+    missing = [c for c in jd_certs if c not in resume_lower]
+    score = round((len(matched) / len(jd_certs)) * 100)
+    return score, matched, missing
+
+
+# ─────────────────────────────────────────────
+# WEIGHTED ATS SCORE COMPUTATION
+# ─────────────────────────────────────────────
+
+ATS_WEIGHTS = {
+    "skills_required":   0.30,   # Required skills match
+    "skills_optional":   0.10,   # Optional/preferred skills
+    "semantic":          0.20,   # Overall semantic similarity
+    "experience":        0.25,   # Experience depth + years
+    "education":         0.10,   # Degree level + relevance
+    "certifications":    0.05,   # Certifications
+}
+
+def compute_ats_score(
+    required_skill_score,
+    optional_skill_score,
+    semantic_score,
+    experience_score,
+    education_score,
+    cert_score
+):
+    """
+    Weighted ATS score based on realistic recruiter priorities.
+    Returns 0–100.
+    """
+    raw = (
+        ATS_WEIGHTS["skills_required"] * required_skill_score +
+        ATS_WEIGHTS["skills_optional"] * optional_skill_score +
+        ATS_WEIGHTS["semantic"] * semantic_score +
+        ATS_WEIGHTS["experience"] * experience_score +
+        ATS_WEIGHTS["education"] * education_score +
+        ATS_WEIGHTS["certifications"] * cert_score
     )
+    return round(min(raw, 100), 2)
 
-    st.subheader("📝 Enter Job Description")
-    job_description = st.text_area("Paste job description here")
 
-    if uploaded_files:
-        st.success(f"{len(uploaded_files)} resumes uploaded")
+# ─────────────────────────────────────────────
+# SECTION EXTRACTION
+# ─────────────────────────────────────────────
+SECTION_HEADERS = {
+    "skills":     ["skills", "technical skills", "key skills", "tools", "technologies"],
+    "experience": ["experience", "work experience", "employment", "professional experience"],
+    "education":  ["education", "qualifications", "academic"],
+    "projects":   ["projects", "personal projects", "academic projects"],
+    "summary":    ["summary", "objective", "profile", "about"]
+}
 
-    if uploaded_files and job_description:
+def extract_section(text, section_keywords):
+    lines = text.lower().split('\n')
+    in_section = False
+    section_text = []
+    for line in lines:
+        if any(kw in line for kw in section_keywords):
+            in_section = True
+            continue
+        if in_section:
+            if any(
+                any(kw in line for kw in v)
+                for k, v in SECTION_HEADERS.items()
+                if not any(kw in line for kw in section_keywords)
+            ):
+                break
+            section_text.append(line)
+    return " ".join(section_text).strip()
 
-        cleaned_jd = job_description
-        jd_parsed = parse_job_description(cleaned_jd)
-        jd_skills = jd_parsed.get("required", []) + jd_parsed.get("optional", [])
 
-        results = []
+# ─────────────────────────────────────────────
+# VISUALIZATION (UNCHANGED)
+# ─────────────────────────────────────────────
+def draw_score_gauge(score):
+    fig, ax = plt.subplots(figsize=(5, 3), subplot_kw=dict(polar=False))
+    fig.patch.set_facecolor('#0f0f1a')
+    ax.set_facecolor('#0f0f1a')
+    theta = np.linspace(np.pi, 0, 200)
+    ax.plot(np.cos(theta), np.sin(theta), color='#2a2a3a', linewidth=20)
+    score_angle = np.pi - (score / 100) * np.pi
+    theta_score = np.linspace(np.pi, score_angle, 200)
+    color = '#00e5ff' if score >= 70 else '#ffb300' if score >= 40 else '#f44336'
+    ax.plot(np.cos(theta_score), np.sin(theta_score), color=color, linewidth=20)
+    ax.text(0, -0.15, f"{score:.1f}%", ha='center', va='center',
+            fontsize=30, color='white', fontweight='bold')
+    ax.text(0, -0.4, get_label(score), ha='center', va='center',
+            fontsize=12, color=color)
+    ax.set_xlim(-1.3, 1.3)
+    ax.set_ylim(-0.6, 1.2)
+    ax.axis('off')
+    return fig
 
-        for file in uploaded_files:
 
-            resume_text = extract_text_from_pdf(file)
+def get_label(score):
+    if score >= 80: return "Excellent Match"
+    elif score >= 65: return "Strong Match"
+    elif score >= 45: return "Moderate Match"
+    else: return "Weak Match"
 
-            if not is_resume(resume_text):
-                continue
 
-            resume_sections = split_sections(resume_text)
-            resume_skills = extract_skills(resume_sections.get("skills", "") + "\n" + resume_text)
+def draw_skill_bar_chart(matched):
+    if not matched:
+        return None
+    labels = [m[0].title() for m in matched]
+    scores = [m[1] * 100 for m in matched]
+    colors = ['#00e5ff' if s >= 80 else '#4fc3f7' if s >= 65 else '#ffb300' for s in scores]
+    fig, ax = plt.subplots(figsize=(7, max(3, len(labels) * 0.5)))
+    fig.patch.set_facecolor('#0f0f1a')
+    ax.set_facecolor('#0f0f1a')
+    bars = ax.barh(labels, scores, color=colors, height=0.6)
+    ax.set_xlim(0, 110)
+    ax.set_xlabel("Match %", color='white')
+    ax.tick_params(colors='white')
+    ax.spines[:].set_visible(False)
+    ax.set_title("Matched Skills", color='white', pad=10)
+    for bar, score in zip(bars, scores):
+        ax.text(bar.get_width() + 1, bar.get_y() + bar.get_height() / 2,
+                f"{score:.0f}%", va='center', color='white', fontsize=9)
+    plt.tight_layout()
+    return fig
 
-            overall_sim = calculate_match_score(resume_text, cleaned_jd)
 
-            # section embeddings
-            resume_embeds = section_embeddings(resume_sections)
-            jd_sections = {"skills": ' '.join(jd_parsed.get("required", [])), "experience": cleaned_jd, "projects": cleaned_jd}
-            jd_embeds = section_embeddings(jd_sections)
+def draw_component_radar(scores_dict):
+    """Radar chart showing all ATS component scores."""
+    labels = list(scores_dict.keys())
+    values = list(scores_dict.values())
+    N = len(labels)
+    angles = np.linspace(0, 2 * np.pi, N, endpoint=False).tolist()
+    values_plot = values + [values[0]]
+    angles += angles[:1]
 
-            experience_sim = 0.0
-            try:
-                if resume_embeds.get("experience") is not None and jd_embeds.get("experience") is not None:
-                    experience_sim = float(cosine_similarity([resume_embeds["experience"]], [jd_embeds["experience"]])[0][0])
-            except Exception:
-                experience_sim = 0.0
+    fig, ax = plt.subplots(figsize=(5, 5), subplot_kw=dict(polar=True))
+    fig.patch.set_facecolor('#0f0f1a')
+    ax.set_facecolor('#0f0f1a')
+    ax.plot(angles, values_plot, 'o-', linewidth=2, color='#00e5ff')
+    ax.fill(angles, values_plot, alpha=0.2, color='#00e5ff')
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(labels, color='white', fontsize=10)
+    ax.set_ylim(0, 100)
+    ax.set_yticks([20, 40, 60, 80, 100])
+    ax.set_yticklabels(['20', '40', '60', '80', '100'], color='#555', fontsize=7)
+    ax.grid(color='#2a2a4a', linestyle='--', linewidth=0.8)
+    ax.spines['polar'].set_color('#2a2a4a')
+    ax.set_title("ATS Component Scores", color='white', pad=20, fontsize=12)
+    return fig
 
-            jd_required = jd_parsed.get("required", [])
-            jd_optional = jd_parsed.get("optional", [])
 
-            common_skills = set(resume_skills) & set(jd_required + jd_optional)
-            missing_required = set(jd_required) - set(resume_skills)
+# ─────────────────────────────────────────────
+# STREAMLIT UI (UNCHANGED STYLING)
+# ─────────────────────────────────────────────
+st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Space+Mono&family=Sora:wght@400;700&display=swap');
+    html, body, [class*="css"] {
+        font-family: 'Sora', sans-serif;
+        background-color: #0f0f1a;
+        color: #e0e0e0;
+    }
+    .stTextArea textarea {
+        background-color: #1a1a2e !important;
+        color: #e0e0e0 !important;
+        border: 1px solid #2a2a4a !important;
+        border-radius: 8px !important;
+        font-family: 'Space Mono', monospace !important;
+        font-size: 13px !important;
+    }
+    .stButton > button {
+        background: linear-gradient(135deg, #00e5ff, #7b2ff7);
+        color: white;
+        font-weight: bold;
+        border: none;
+        border-radius: 8px;
+        padding: 0.6rem 2rem;
+        font-size: 16px;
+    }
+    .metric-box {
+        background: #1a1a2e;
+        border: 1px solid #2a2a4a;
+        border-radius: 12px;
+        padding: 16px 20px;
+        margin-bottom: 12px;
+    }
+    .skill-tag {
+        display: inline-block;
+        padding: 4px 12px;
+        border-radius: 20px;
+        font-size: 13px;
+        margin: 4px;
+        font-family: 'Space Mono', monospace;
+    }
+    .matched { background: #003d2e; color: #00e5b0; border: 1px solid #00e5b0; }
+    .missing { background: #3d0000; color: #ff5252; border: 1px solid #ff5252; }
+    .optional-tag { background: #1a1a00; color: #ffb300; border: 1px solid #ffb300; }
+    .weight-badge {
+        display: inline-block;
+        background: #1a1a2e;
+        border: 1px solid #2a2a4a;
+        border-radius: 6px;
+        padding: 2px 8px;
+        font-size: 11px;
+        color: #888;
+        margin-left: 6px;
+        font-family: 'Space Mono', monospace;
+    }
+    </style>
+""", unsafe_allow_html=True)
 
-            req_score = (len(set(resume_skills) & set(jd_required)) / len(jd_required) * 100) if jd_required else 0
-            opt_score = (len(set(resume_skills) & set(jd_optional)) / len(jd_optional) * 100) if jd_optional else 0
-            skill_score = (0.75 * req_score) + (0.25 * opt_score)
+# HEADER
+st.markdown("""
+    <h1 style='font-family:Sora;font-size:2.4rem;
+    background:linear-gradient(90deg,#00e5ff,#7b2ff7);
+    -webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:4px;'>
+    AI Resume Screener
+    </h1>
+    <p style='color:#888;margin-top:0;font-size:15px;'>
+    BERT-powered contextual matching — not just keywords
+    </p>
+    <hr style='border-color:#2a2a4a;margin:16px 0;'>
+""", unsafe_allow_html=True)
 
-            experience_score = experience_sim * 100
+# ─────────────────────────────────────────────
+# INPUT SECTION
+# ─────────────────────────────────────────────
+col1, col2 = st.columns(2)
 
-            final_score = (0.5 * overall_sim * 100) + (0.3 * skill_score) + (0.2 * experience_score)
+with col1:
+    st.markdown("#### Upload Resume (PDF)")
+    resume_file = st.file_uploader("", type=["pdf"], key="resume")
 
-            results.append({
-                "Resume": file.name,
-                "Final Score (%)": round(final_score, 2),
-                "Overall (%)": round(overall_sim * 100, 2),
-                "Skill Match (%)": round(skill_score, 2),
-                "Experience (%)": round(experience_score, 2),
-                "Matched Skills": ", ".join(sorted(list(common_skills))),
-                "Missing Required": ", ".join(sorted(list(missing_required)))
-            })
+with col2:
+    st.markdown("#### Job Description")
+    jd_text_input = st.text_area("Paste the Job Description here", height=220, key="jd")
 
-        results = sorted(results, key=lambda x: x["Final Score (%)"], reverse=True)
+threshold = st.slider(
+    "Skill Match Threshold",
+    min_value=0.40, max_value=0.90, value=0.65, step=0.05,
+    help="Higher = stricter skill matching. 0.65 is recommended."
+)
 
-        st.subheader("🏆 Candidate Ranking")
+analyze_btn = st.button("Analyze Resume")
 
-        if results:
-            df = pd.DataFrame(results)
-            st.dataframe(df)
+# ─────────────────────────────────────────────
+# ANALYSIS
+# ─────────────────────────────────────────────
+if analyze_btn:
+    if not resume_file or not jd_text_input.strip():
+        st.warning("Please upload a resume PDF and paste a job description.")
+    else:
+        with st.spinner("Running BERT analysis..."):
 
-            st.success(f"🥇 Top Candidate: {results[0]['Resume']} ({results[0]['Final Score (%)']}%)")
+            # 1. Extract & clean
+            raw_resume = extract_text_from_pdf(resume_file)
+            resume_clean = clean_text(raw_resume)
+            jd_clean = clean_text(jd_text_input)
 
-            st.subheader("📊 Score Visualization")
-            st.bar_chart(df.set_index("Resume")["Final Score (%)"])
+            if len(resume_clean) < 50:
+                st.error("Could not extract enough text from the PDF. Try a text-based PDF.")
+                st.stop()
 
-            # Pie chart for top candidate skill match vs missing
-            top = results[0]
-            matched = len(top["Matched Skills"].split(", ")) if top["Matched Skills"] else 0
-            missing = len(top["Missing Required"].split(", ")) if top["Missing Required"] else 0
-            fig, ax = plt.subplots()
-            ax.pie([matched, missing], labels=["Matched", "Missing"], autopct="%1.1f%%", colors=["#4CAF50", "#F44336"])
-            ax.set_title("Top candidate: Skill match vs Missing required")
-            st.pyplot(fig)
+            # 2. Overall BERT semantic score (0–100)
+            bert_score_raw = bert_similarity_score(resume_clean, jd_clean)
+            semantic_score = round(bert_score_raw * 100, 2)
 
-            # allow exporting full results
-            csv_buf = io.StringIO()
-            df.to_csv(csv_buf, index=False)
-            st.download_button("Download all results as CSV", data=csv_buf.getvalue(), file_name="candidate_ranking.csv")
+            # 3. Classify JD skills: required vs optional
+            required_jd_skills, optional_jd_skills = classify_jd_skills(jd_text_input)
+            resume_skills = extract_skills_from_text(resume_clean)
 
+            # 4. Match required skills (weighted heavier)
+            matched_required, missing_required = match_skills_bert(
+                resume_skills, required_jd_skills, threshold=threshold
+            )
+            if required_jd_skills:
+                required_skill_score = round((len(matched_required) / len(required_jd_skills)) * 100)
+            else:
+                required_skill_score = semantic_score  # fallback
+
+            # 5. Match optional skills
+            matched_optional, missing_optional = match_skills_bert(
+                resume_skills, optional_jd_skills, threshold=threshold
+            )
+            if optional_jd_skills:
+                optional_skill_score = round((len(matched_optional) / len(optional_jd_skills)) * 100)
+            else:
+                optional_skill_score = 50  # neutral if none specified
+
+            # All matched/missing for display
+            all_matched = matched_required + matched_optional
+            all_missing = missing_required + missing_optional
+
+            # 6. Experience score
+            exp_score, resume_years, required_years, resume_level, jd_level = score_experience(
+                raw_resume, jd_text_input
+            )
+
+            # 7. Education score
+            edu_score, degree_name, resume_deg_level, jd_deg_level = score_education(
+                raw_resume, jd_text_input
+            )
+
+            # 8. Certification score
+            cert_score, matched_certs, missing_certs = score_certifications(
+                raw_resume, jd_text_input
+            )
+
+            # 9. Weighted final ATS score
+            final_ats_score = compute_ats_score(
+                required_skill_score=required_skill_score,
+                optional_skill_score=optional_skill_score,
+                semantic_score=semantic_score,
+                experience_score=exp_score,
+                education_score=edu_score,
+                cert_score=cert_score
+            )
+
+        # ─────────────────────────────────────────────
+        # RESULTS
+        # ─────────────────────────────────────────────
+        st.markdown("<hr style='border-color:#2a2a4a;'>", unsafe_allow_html=True)
+        st.markdown("## Analysis Results")
+
+        g_col, m_col = st.columns([1.2, 1.8])
+
+        with g_col:
+            fig_gauge = draw_score_gauge(final_ats_score)
+            st.pyplot(fig_gauge, use_container_width=True)
+            plt.close()
+
+        with m_col:
+            st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+            st.markdown(f"""
+                <div class='metric-box'>
+                    <p style='margin:0;color:#888;font-size:12px;'>Required Skills Match
+                        <span class='weight-badge'>30% weight</span></p>
+                    <p style='margin:0;font-size:22px;font-weight:bold;color:#00e5ff;'>{required_skill_score}%</p>
+                </div>
+                <div class='metric-box'>
+                    <p style='margin:0;color:#888;font-size:12px;'>Experience Score
+                        <span class='weight-badge'>25% weight</span></p>
+                    <p style='margin:0;font-size:22px;font-weight:bold;color:#7b2ff7;'>{exp_score}%
+                        <span style='font-size:13px;color:#888;'> · {resume_years}y detected / {required_years}y required</span></p>
+                </div>
+                <div class='metric-box'>
+                    <p style='margin:0;color:#888;font-size:12px;'>Semantic Similarity
+                        <span class='weight-badge'>20% weight</span></p>
+                    <p style='margin:0;font-size:22px;font-weight:bold;color:#ffb300;'>{semantic_score:.1f}%</p>
+                </div>
+                <div class='metric-box'>
+                    <p style='margin:0;color:#888;font-size:12px;'>Education Score
+                        <span class='weight-badge'>10% weight</span></p>
+                    <p style='margin:0;font-size:22px;font-weight:bold;color:#4fc3f7;'>{edu_score}%
+                        <span style='font-size:13px;color:#888;'> · {degree_name}</span></p>
+                </div>
+            """, unsafe_allow_html=True)
+
+        # Radar chart of all components
+        st.markdown("---")
+        radar_col, cert_col = st.columns([1.2, 1])
+
+        with radar_col:
+            st.markdown("#### Score Components Radar")
+            radar_data = {
+                "Req. Skills": required_skill_score,
+                "Opt. Skills": optional_skill_score,
+                "Semantic": semantic_score,
+                "Experience": exp_score,
+                "Education": edu_score,
+                "Certs": cert_score
+            }
+            fig_radar = draw_component_radar(radar_data)
+            st.pyplot(fig_radar, use_container_width=True)
+            plt.close()
+
+        with cert_col:
+            st.markdown("#### Certifications")
+            if matched_certs:
+                st.markdown("**Matched:**")
+                for c in matched_certs:
+                    st.markdown(f"<span class='skill-tag matched'>{c.title()}</span>", unsafe_allow_html=True)
+            if missing_certs:
+                st.markdown("**Missing from JD:**")
+                for c in missing_certs:
+                    st.markdown(f"<span class='skill-tag missing'>{c.title()}</span>", unsafe_allow_html=True)
+            if not matched_certs and not missing_certs:
+                st.info("No specific certifications detected in JD.")
+            st.markdown(f"""
+                <div class='metric-box' style='margin-top:12px;'>
+                    <p style='margin:0;color:#888;font-size:12px;'>Cert Score
+                        <span class='weight-badge'>5% weight</span></p>
+                    <p style='margin:0;font-size:22px;font-weight:bold;color:#00e5b0;'>{cert_score}%</p>
+                </div>
+            """, unsafe_allow_html=True)
+
+        # Skills breakdown
+        st.markdown("---")
+        s1, s2 = st.columns(2)
+
+        with s1:
+            st.markdown(f"#### Required Skills ({len(matched_required)} / {len(required_jd_skills)} matched)")
+            if matched_required:
+                tags = "".join([
+                    f"<span class='skill-tag matched'>{s[0].title()} · {s[1]*100:.0f}%</span>"
+                    for s in matched_required
+                ])
+                st.markdown(tags, unsafe_allow_html=True)
+            if missing_required:
+                st.markdown("**Missing required:**")
+                tags = "".join([
+                    f"<span class='skill-tag missing'>{s.title()}</span>"
+                    for s in missing_required
+                ])
+                st.markdown(tags, unsafe_allow_html=True)
+
+        with s2:
+            st.markdown(f"#### Optional / Preferred Skills ({len(matched_optional)} / {len(optional_jd_skills)} matched)")
+            if matched_optional:
+                tags = "".join([
+                    f"<span class='skill-tag optional-tag'>{s[0].title()} · {s[1]*100:.0f}%</span>"
+                    for s in matched_optional
+                ])
+                st.markdown(tags, unsafe_allow_html=True)
+            if missing_optional:
+                st.markdown("**Not found (optional):**")
+                tags = "".join([
+                    f"<span class='skill-tag missing'>{s.title()}</span>"
+                    for s in missing_optional
+                ])
+                st.markdown(tags, unsafe_allow_html=True)
+            if not optional_jd_skills:
+                st.info("No optional skills detected in JD.")
+
+        # Skill bar chart
+        if all_matched:
+            st.markdown("---")
+            st.markdown("#### Skill Match Breakdown")
+            fig_bar = draw_skill_bar_chart(all_matched)
+            if fig_bar:
+                st.pyplot(fig_bar, use_container_width=True)
+                plt.close()
+
+        # Insight
+        st.markdown("---")
+        st.markdown("#### Insights")
+
+        insights = []
+
+        if required_skill_score < 50:
+            missing_preview = ', '.join(missing_required[:3]) if missing_required else 'N/A'
+            insights.append(f"⚠️ <b>Critical gap:</b> Only {required_skill_score}% of required skills matched. Missing: {missing_preview}.")
+        if resume_years < required_years and required_years > 0:
+            insights.append(f"⚠️ <b>Experience gap:</b> Resume shows ~{resume_years} years, JD requires {required_years}+ years.")
+        if edu_score < 50:
+            insights.append(f"⚠️ <b>Education gap:</b> Detected degree ({degree_name}) may be below JD requirements.")
+        if optional_skill_score > 70:
+            insights.append(f"✅ <b>Strong preferred skills match ({optional_skill_score}%).</b> Candidate has desirable bonus skills.")
+        if final_ats_score >= 80:
+            insights.append("🔥 <b>Strong overall candidate.</b> Resume aligns well across all key parameters.")
+        elif final_ats_score >= 60:
+            insights.append("👍 <b>Good match.</b> Solid alignment on most parameters with some gaps.")
+        elif final_ats_score >= 40:
+            insights.append("⚡ <b>Moderate match.</b> Relevant background but notable gaps in key areas.")
         else:
-            st.error("❌ No valid resumes found")
+            insights.append("❌ <b>Weak match.</b> Resume does not align well with this role's requirements.")
 
-# ------------------ DEFAULT ------------------
+        for insight in insights:
+            st.markdown(f"<div class='metric-box'>{insight}</div>", unsafe_allow_html=True)
 
-if role is None:
-    st.info("👆 Please select your role to continue")
+        # Summary table
+        st.markdown("---")
+        st.markdown("#### Score Summary")
+        summary_df = pd.DataFrame({
+            "Parameter": [
+                "🏆 Final ATS Score",
+                "✅ Required Skills Match",
+                "⭐ Optional Skills Match",
+                "🧠 Semantic Similarity",
+                "💼 Experience Score",
+                "🎓 Education Score",
+                "📜 Certification Score"
+            ],
+            "Score": [
+                f"{final_ats_score:.1f}%",
+                f"{required_skill_score}%",
+                f"{optional_skill_score}%",
+                f"{semantic_score:.1f}%",
+                f"{exp_score}%",
+                f"{edu_score}%",
+                f"{cert_score}%"
+            ],
+            "Weight": [
+                "Composite",
+                "30%",
+                "10%",
+                "20%",
+                "25%",
+                "10%",
+                "5%"
+            ]
+        })
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
